@@ -52,3 +52,7 @@ Please setup your Betaflight OSD to match:
 20) Voltage (actually at the bottom)
 
 21) System Messages (next to the Voltage)
+
+Disclaimer
+-
+This project is not affiliated with Walksnail/Caddx.
