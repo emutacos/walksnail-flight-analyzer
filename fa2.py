@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
 # ==========================================
-# 1. THE PARSER (OSD -> CSV)
+# 1. THE PARSER (OSD -> CSV) [Optimized High-Res]
 # ==========================================
 def parse_walksnail_osd(input_file, cipher, speed_regex):
     base_name = os.path.splitext(input_file)[0]
@@ -42,7 +42,6 @@ def parse_walksnail_osd(input_file, cipher, speed_regex):
     ]
 
     csv_rows = []
-    last_logged_time = None
 
     patterns = {
         'time': r'(\d{1,2}:\d{2}(?::\d{2})?)',
@@ -63,15 +62,16 @@ def parse_walksnail_osd(input_file, cipher, speed_regex):
         'voltage': r'([\d\.\s]{1,15})\x06'
     }
 
-    log.append(">> Extracting aerodynamic variables...")
+    compiled_patterns = {key: re.compile(pat) for key, pat in patterns.items()}
+
+    log.append(">> Extracting aerodynamic variables at high resolution...")
     for frame in frames:
-        row = []
         def extract(key, group=1, default=""):
-            match = re.search(patterns[key], frame)
+            match = compiled_patterns[key].search(frame)
             return match.group(group).replace(' ', '') if match else default
             
         def extract_dist(key):
-            match = re.search(patterns[key], frame)
+            match = compiled_patterns[key].search(frame)
             if match:
                 val_str = match.group(1).replace(' ', '')
                 if match.group(2) == '~':
@@ -90,11 +90,10 @@ def parse_walksnail_osd(input_file, cipher, speed_regex):
             extract('mah'), extract('wattage'), extract('amps'), extract('voltage')
         ]
 
-        if sum(1 for item in row if item != "") >= 5 and flight_time and flight_time != last_logged_time:
+        if sum(1 for item in row if item != "") >= 5 and flight_time:
             csv_rows.append(row)
-            last_logged_time = flight_time
 
-    log.append(f">> Successfully yielded {len(csv_rows):,} valid rows")
+    log.append(f">> Successfully yielded {len(csv_rows):,} high-resolution rows")
     if len(frames) > 0:
         log.append(f">> Frame validation yield: {(len(csv_rows)/len(frames))*100:.1f}%")
         
@@ -202,7 +201,11 @@ class FlightDashboard(tk.Tk):
         super().__init__()
         self.title("Walksnail Flight Analyzer V.2")
         self.geometry("1500x950")
-        self.iconbitmap("icon.ico")
+        
+        try:
+            self.iconbitmap("icon.ico")
+        except Exception:
+            pass
 
         self.file1 = None
         self.file2 = None
@@ -243,7 +246,6 @@ class FlightDashboard(tk.Tk):
         settings_menu.add_command(label="Parser Rules...", command=self.open_settings_window)
         menubar.add_cascade(label="Settings", menu=settings_menu)
         
-        # --- HELP MENU ---
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="About", command=self.open_about_window)
         menubar.add_cascade(label="Help", menu=help_menu)
@@ -264,13 +266,11 @@ class FlightDashboard(tk.Tk):
                 self.color2.set(color)
                 self.btn_c2.config(fg=color)
 
-        # Toolbar: Analyze Button & Clear Button (Far Left)
         tk.Button(toolbar, text="▶ ANALYZE", bg="#2a9d8f", fg="white", font=("Arial", 9, "bold"), cursor="hand2", command=self.run_analysis, padx=12).pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(toolbar, text="CLEAR", bg="#e76f51", fg="white", font=("Arial", 9, "bold"), cursor="hand2", command=self.clear_all, padx=10).pack(side=tk.LEFT, padx=(0, 10))
         
         tk.Frame(toolbar, width=2, bg="gray").pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=2)
 
-        # Toolbar: Flight 1
         tk.Label(toolbar, text="Flight 1:", font=("Arial", 10, "bold"), bg="#e9ecef").pack(side=tk.LEFT, padx=(5,2))
         self.name1 = tk.Entry(toolbar, width=12)
         self.name1.insert(0, "Flight 1")
@@ -292,7 +292,6 @@ class FlightDashboard(tk.Tk):
         
         tk.Frame(toolbar, width=2, bg="gray").pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=2)
         
-        # Toolbar: Flight 2
         tk.Label(toolbar, text="Flight 2:", font=("Arial", 10, "bold"), bg="#e9ecef").pack(side=tk.LEFT, padx=(15,2))
         self.name2 = tk.Entry(toolbar, width=12)
         self.name2.insert(0, "Flight 2")
@@ -380,7 +379,6 @@ class FlightDashboard(tk.Tk):
         self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
     def clear_all(self):
-        """Resets the dashboard completely for a fresh comparison session"""
         self.file1 = None
         self.file2 = None
         self.osd1_path = None
@@ -388,7 +386,6 @@ class FlightDashboard(tk.Tk):
         self.current_craft1 = ""
         self.current_craft2 = ""
         
-        # Reset Flight Names & Sync checkboxes
         self.name1.delete(0, tk.END)
         self.name1.insert(0, "Flight 1")
         self.sync_name1_var.set(False)
@@ -397,14 +394,12 @@ class FlightDashboard(tk.Tk):
         self.name2.insert(0, "Flight 2")
         self.sync_name2_var.set(False)
         
-        # Clear File Labels & Craft tags
         self.lbl_f1.config(text="[No file loaded]", fg="gray", font=("Arial", 9, "italic"))
         self.craft_lbl_f1.config(text="")
         
         self.lbl_f2.config(text="[No file loaded]", fg="gray", font=("Arial", 9, "italic"))
         self.craft_lbl_f2.config(text="")
         
-        # Clear Consoles
         self.txt_log1.config(state=tk.NORMAL)
         self.txt_log1.delete(1.0, tk.END)
         self.txt_log1.insert(tk.END, ">> Awaiting Flight 1 OSD...")
@@ -415,16 +410,13 @@ class FlightDashboard(tk.Tk):
         self.txt_log2.insert(tk.END, ">> Awaiting Flight 2 OSD...")
         self.txt_log2.config(state=tk.DISABLED)
         
-        # Clear Metrics Table
         for widget in self.table_frame.winfo_children():
             widget.destroy()
             
-        # Reset Status / Verdict Bar
         for widget in self.status_frame.winfo_children():
             widget.destroy()
-        tk.Label(self.status_frame, text="Ready. Load two flights via the File menu to calculate performance verdicts.", bg="#e9ecef", fg="gray", font=("Arial", 10, "italic")).pack(side=tk.LEFT)
+        tk.Label(self.status_frame, text="Ready. Load two flights via the File menu to calculate performance summary.", bg="#e9ecef", fg="gray", font=("Arial", 10, "italic")).pack(side=tk.LEFT)
         
-        # Clear Graphs
         for widget in self.plot_frame.winfo_children():
             widget.destroy()
 
@@ -459,9 +451,6 @@ class FlightDashboard(tk.Tk):
         tk.Label(pad_frame, text="(Changes will apply on next file load)", fg="gray", font=("Arial", 9)).grid(row=3, column=0, columnspan=2, pady=10)
 
     def open_about_window(self):
-        """Opens a scrollable message-style About window with a scaled header icon"""
-        from PIL import Image, ImageTk
-        
         about_win = tk.Toplevel(self)
         about_win.title("About Walksnail Flight Analyzer")
         about_win.geometry("500x450")
@@ -470,59 +459,44 @@ class FlightDashboard(tk.Tk):
         content_frame = tk.Frame(about_win, padx=15, pady=15, bg="#f0f0f0")
         content_frame.pack(fill=tk.BOTH, expand=True)
         
-        # --- SCALED HEADER LOGO ---
         try:
+            from PIL import Image, ImageTk
             if os.path.exists("icon.png"):
                 pil_img = Image.open("icon.png")
-                pil_img = pil_img.resize((128, 128), Image.Resampling.LANCZOS) # Forces a neat header size
+                pil_img = pil_img.resize((128, 128), Image.Resampling.LANCZOS)
                 self.about_logo = ImageTk.PhotoImage(pil_img)
                 logo_label = tk.Label(content_frame, image=self.about_logo, bg="#f0f0f0")
                 logo_label.pack(pady=(0, 10))
         except Exception:
             pass 
             
-        # --- SCROLLABLE TEXT BOX ---
         txt_frame = tk.Frame(content_frame, bg="#f0f0f0")
         txt_frame.pack(fill=tk.BOTH, expand=True)
         
-        txt = tk.Text(
-            txt_frame, 
-            wrap="word", 
-            font=("Arial", 10), 
-            bg="#f0f0f0", 
-            fg="#222222", 
-            relief=tk.FLAT, 
-            borderwidth=0, 
-            highlightthickness=0,
-            padx=5, 
-            pady=5
-        )
+        txt = tk.Text(txt_frame, wrap="word", font=("Arial", 10), bg="#f0f0f0", fg="#222222", relief=tk.FLAT, borderwidth=0, highlightthickness=0, padx=5, pady=5)
         scroll = tk.Scrollbar(txt_frame, orient="vertical", command=txt.yview)
         txt.configure(yscrollcommand=scroll.set)
         
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
-        content = "About file not found.\nPlease ensure an 'about.fa2' file is placed in the same directory as the script."
+        content = "Walksnail Flight Analyzer\nHigh-resolution OSD parsing and aerodynamic comparison dashboard."
         try:
             if os.path.exists("about.fa2"):
                 with open("about.fa2", "r", encoding="utf-8") as f:
                     content = f.read()
         except Exception as e:
-            content = f"Error reading about.fa2: {str(e)}"
+            content = f"Error reading about: {str(e)}"
             
         txt.insert(tk.END, content)
         txt.config(state=tk.DISABLED)
         
-        # --- OK BUTTON ---
         btn_frame = tk.Frame(content_frame, bg="#f0f0f0", pady=10)
         btn_frame.pack(fill=tk.X)
-        ok_btn = tk.Button(btn_frame, text="OK", width=10, command=about_win.destroy, relief=tk.RAISED)
-        ok_btn.pack()
+        tk.Button(btn_frame, text="OK", width=10, command=about_win.destroy, relief=tk.RAISED).pack()
 
     def open_debug_window(self, flight_num):
         path = self.osd1_path if flight_num == 1 else self.osd2_path
-        
         if not path:
             messagebox.showinfo("Error", f"Please load an OSD file for Flight {flight_num} first.")
             return
@@ -552,9 +526,6 @@ class FlightDashboard(tk.Tk):
             frames = cleaned_data.split(self.cipher_var.get())[:50] 
             
             txt.insert(tk.END, "=== RAW OSD STRING PREVIEW (First 50 Frames) ===\n")
-            txt.insert(tk.END, "The repr() function below reveals all hidden hexadecimal characters.\n")
-            txt.insert(tk.END, "Look for your craft name and note the exact string of characters (e.g., \\x14) directly before and after it.\n\n")
-            
             for i, frame in enumerate(frames):
                 txt.insert(tk.END, f"--- FRAME {i} ---\n", "header")
                 txt.insert(tk.END, repr(frame) + "\n\n", "code")
@@ -562,7 +533,6 @@ class FlightDashboard(tk.Tk):
             txt.tag_config("header", foreground="#569cd6", font=("Consolas", 11, "bold"))
             txt.tag_config("code", foreground="#ce9178")
             txt.config(state=tk.DISABLED)
-            
         except Exception as e:
             txt.insert(tk.END, f"Error reading file: {str(e)}")
 
@@ -571,7 +541,6 @@ class FlightDashboard(tk.Tk):
         try:
             with open(filepath, 'r', encoding='cp1252', errors='ignore') as f:
                 raw_data = f.read()
-            
             cleaned_data = raw_data.replace('\x00', '').replace('\r', ' ')
             if "- - -" in cleaned_data and "S T A T S" in cleaned_data:
                 cleaned_data = cleaned_data[:cleaned_data.find("- - -")]
@@ -579,16 +548,12 @@ class FlightDashboard(tk.Tk):
                 cleaned_data = cleaned_data[cleaned_data.rfind("A R M E D") + 9:]
             elif "BTFL" in cleaned_data:
                 cleaned_data = cleaned_data[cleaned_data.rfind("BTFL") + 4:]
-                
             frames = cleaned_data.split(cipher)
-            
             if len(frames) > 0:
-                frame_zero = frames[0]
-                match = re.search(regex, frame_zero)
+                match = re.search(regex, frames[0])
                 if match:
                     craft = match.group(1).strip()
-                    if craft: 
-                        return craft
+                    if craft: return craft
         except Exception:
             pass
         return "Unknown"
@@ -598,7 +563,6 @@ class FlightDashboard(tk.Tk):
         if f:
             self.osd1_path = f
             self.lbl_f1.config(text=os.path.basename(f), fg="black", font=("Arial", 9, "bold"))
-            
             craft = self.get_craft_name(f, self.cipher_var.get(), self.craft_regex_var.get())
             if craft != "Unknown":
                 self.current_craft1 = craft
@@ -623,7 +587,6 @@ class FlightDashboard(tk.Tk):
         if f:
             self.osd2_path = f
             self.lbl_f2.config(text=os.path.basename(f), fg="black", font=("Arial", 9, "bold"))
-            
             craft = self.get_craft_name(f, self.cipher_var.get(), self.craft_regex_var.get())
             if craft != "Unknown":
                 self.current_craft2 = craft
@@ -685,35 +648,19 @@ class FlightDashboard(tk.Tk):
         spd_win, spd_col = get_winner(d1["Max Speed"], d2["Max Speed"], n1, n2, c1, c2, False)
 
         tk.Label(self.status_frame, text="FLIGHT COMPARISON SUMMARY:", font=("Arial", 10, "bold"), bg="#e9ecef").pack(side=tk.LEFT, padx=(5, 15))
-        
         tk.Label(self.status_frame, text="🏆 Most Efficient: ", font=("Arial", 10), bg="#e9ecef").pack(side=tk.LEFT)
         tk.Label(self.status_frame, text=eff_win, font=("Arial", 10, "bold"), fg=eff_col, bg="#e9ecef").pack(side=tk.LEFT)
         tk.Label(self.status_frame, text="   |   ", font=("Arial", 10), bg="#e9ecef").pack(side=tk.LEFT)
-        
         tk.Label(self.status_frame, text="💨 Least Overall Drag: ", font=("Arial", 10), bg="#e9ecef").pack(side=tk.LEFT)
         tk.Label(self.status_frame, text=drag_win, font=("Arial", 10, "bold"), fg=drag_col, bg="#e9ecef").pack(side=tk.LEFT)
         tk.Label(self.status_frame, text="   |   ", font=("Arial", 10), bg="#e9ecef").pack(side=tk.LEFT)
-        
         tk.Label(self.status_frame, text="🚀 Highest Top Speed: ", font=("Arial", 10), bg="#e9ecef").pack(side=tk.LEFT)
         tk.Label(self.status_frame, text=spd_win, font=("Arial", 10, "bold"), fg=spd_col, bg="#e9ecef").pack(side=tk.LEFT)
-
-        bc1_str = f"{best_cruise1} mph" if best_cruise1 > 0 else "N/A"
-        bc2_str = f"{best_cruise2} mph" if best_cruise2 > 0 else "N/A"
-        
-        tk.Label(self.status_frame, text="   |   ", font=("Arial", 10), bg="#e9ecef").pack(side=tk.LEFT)
-        tk.Label(self.status_frame, text="🎯 Best Cruise: ", font=("Arial", 10), bg="#e9ecef").pack(side=tk.LEFT)
-        
-        tk.Label(self.status_frame, text=f"{n1}: ", font=("Arial", 10), bg="#e9ecef").pack(side=tk.LEFT)
-        tk.Label(self.status_frame, text=bc1_str, font=("Arial", 10, "bold"), fg=c1, bg="#e9ecef").pack(side=tk.LEFT)
-        tk.Label(self.status_frame, text=" vs ", font=("Arial", 10), bg="#e9ecef").pack(side=tk.LEFT)
-        tk.Label(self.status_frame, text=f"{n2}: ", font=("Arial", 10), bg="#e9ecef").pack(side=tk.LEFT)
-        tk.Label(self.status_frame, text=bc2_str, font=("Arial", 10, "bold"), fg=c2, bg="#e9ecef").pack(side=tk.LEFT)
 
         for widget in self.table_frame.winfo_children():
             widget.destroy()
 
         padding_y = 3
-        
         tk.Label(self.table_frame, text="Metric", font=("Arial", 11, "bold"), bg="#f8f9fa", anchor="w").grid(row=0, column=0, sticky="w", pady=(5, 10))
         tk.Label(self.table_frame, text=n1, font=("Arial", 11, "bold"), bg="#f8f9fa", anchor="e", fg=c1).grid(row=0, column=1, sticky="e", padx=15, pady=(5, 10))
         tk.Label(self.table_frame, text=n2, font=("Arial", 11, "bold"), bg="#f8f9fa", anchor="e", fg=c2).grid(row=0, column=2, sticky="e", padx=15, pady=(5, 10))
@@ -740,6 +687,7 @@ class FlightDashboard(tk.Tk):
             tk.Label(self.table_frame, text=fmt.format(d2[key]), font=("Consolas", 10), bg="#f8f9fa").grid(row=row_idx, column=2, sticky="e", padx=15, pady=padding_y)
             row_idx += 1
             
+        # RESTORED: Attitude by Speed Tier section
         tk.Frame(self.table_frame, height=2, bd=1, relief=tk.SUNKEN, bg="gray").grid(row=row_idx, column=0, columnspan=3, sticky="we", pady=8)
         row_idx += 1
         
@@ -752,21 +700,22 @@ class FlightDashboard(tk.Tk):
             tk.Label(self.table_frame, text=f"{b} mph", font=("Arial", 10, "bold"), bg="#f8f9fa", anchor="w").grid(row=row_idx, column=0, sticky="w", pady=1)
             
             if b in tiers1:
-                t1 = tiers1[b]
-                txt1 = f"{t1['pitch']:.1f}° pitch, {t1['throttle']:.0f}% thr, {t1['watt']:.0f} W"
+                t1_data = tiers1[b]
+                txt1 = f"{t1_data['pitch']:.1f}° pitch, {t1_data['throttle']:.0f}% thr, {t1_data['watt']:.0f} W"
             else:
                 txt1 = "N/A"
                 
             if b in tiers2:
-                t2 = tiers2[b]
-                txt2 = f"{t2['pitch']:.1f}° pitch, {t2['throttle']:.0f}% thr, {t2['watt']:.0f} W"
+                t2_data = tiers2[b]
+                txt2 = f"{t2_data['pitch']:.1f}° pitch, {t2_data['throttle']:.0f}% thr, {t2_data['watt']:.0f} W"
             else:
                 txt2 = "N/A"
                 
             tk.Label(self.table_frame, text=txt1, font=("Consolas", 9), bg="#f8f9fa").grid(row=row_idx, column=1, sticky="e", padx=15, pady=1)
             tk.Label(self.table_frame, text=txt2, font=("Consolas", 9), bg="#f8f9fa").grid(row=row_idx, column=2, sticky="e", padx=15, pady=1)
             row_idx += 1
-            
+
+        # RESTORED: Drag Profile by Tier section
         tk.Frame(self.table_frame, height=2, bd=1, relief=tk.SUNKEN, bg="gray").grid(row=row_idx, column=0, columnspan=3, sticky="we", pady=8)
         row_idx += 1
         
@@ -798,7 +747,7 @@ class FlightDashboard(tk.Tk):
             tk.Label(self.table_frame, text=txt1, font=("Consolas", 10, font_wt1), fg=t_col1, bg="#f8f9fa").grid(row=row_idx, column=1, sticky="e", padx=15, pady=1)
             tk.Label(self.table_frame, text=txt2, font=("Consolas", 10, font_wt2), fg=t_col2, bg="#f8f9fa").grid(row=row_idx, column=2, sticky="e", padx=15, pady=1)
             row_idx += 1
-
+            
         for widget in self.plot_frame.winfo_children():
             widget.destroy()
             
@@ -807,7 +756,7 @@ class FlightDashboard(tk.Tk):
         
         fig = plt.figure(figsize=(10, 9))
         gs = fig.add_gridspec(4, 2, width_ratios=[1.5, 1])
-        fig.suptitle(f'Flight Profile & Aerodynamic Efficiency', fontsize=14, fontweight='bold')
+        fig.suptitle(f'Flight Profile & Aerodynamic Efficiency (High-Res)', fontsize=14, fontweight='bold')
         
         ax1 = fig.add_subplot(gs[0, 0])
         ax2 = fig.add_subplot(gs[1, 0], sharex=ax1)
@@ -841,13 +790,11 @@ class FlightDashboard(tk.Tk):
         
         spds1 = sorted([b for b in tiers1.keys() if b > 0])
         drg1 = [tiers1[b]['watt'] / b for b in spds1]
-        
         spds2 = sorted([b for b in tiers2.keys() if b > 0])
         drg2 = [tiers2[b]['watt'] / b for b in spds2]
 
         ax5.plot(spds1, drg1, marker='o', color=c1, label=n1, linewidth=2)
         ax5.plot(spds2, drg2, marker='o', color=c2, label=n2, linewidth=2)
-        
         ax5.set_xlabel('Speed (mph)', fontweight='bold')
         ax5.set_ylabel('Drag Cost (Watts per mph)', fontweight='bold')
         ax5.grid(True, linestyle='--', alpha=0.5)
@@ -857,8 +804,8 @@ class FlightDashboard(tk.Tk):
         
         canvas = FigureCanvasTkAgg(fig, master=self.plot_frame)
         canvas.draw()
-        toolbar = NavigationToolbar2Tk(canvas, self.plot_frame)
-        toolbar.update()
+        toolbar_plt = NavigationToolbar2Tk(canvas, self.plot_frame)
+        toolbar_plt.update()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
 if __name__ == "__main__":
