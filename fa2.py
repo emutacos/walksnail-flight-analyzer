@@ -200,7 +200,7 @@ def extract_plot_data(filepath):
 class FlightDashboard(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Walksnail Flight Analyzer")
+        self.title("Walksnail Flight Analyzer V.2")
         self.geometry("1500x950")
         self.iconbitmap("icon.ico")
 
@@ -463,7 +463,7 @@ class FlightDashboard(tk.Tk):
         from PIL import Image, ImageTk
         
         about_win = tk.Toplevel(self)
-        about_win.title("About FPV Aerodynamic Flight Analyzer")
+        about_win.title("About Walksnail Flight Analyzer")
         about_win.geometry("500x450")
         about_win.grab_set()
         
