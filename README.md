@@ -9,7 +9,7 @@ Please setup your Betaflight OSD to match:
 
 * I Find it's easier to start at the bottom and work your way up
 
-*Not all numbered items are on their own row, see notes by each entry
+* Not all numbered items are on their own row, see notes by each entry
 
 1) Craft Name 
 
