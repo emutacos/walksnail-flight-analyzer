@@ -3,10 +3,13 @@
 This tool is designed to help you find the differences between two flights using the .osd file that Walksnail Goggles generate with every flight. It is important that your OSD matches the following layout as this version doesn't fully support reading from other OSD layouts. This tool is only tested to work with Betaflight font setting in the goggles menu.
 
 Please setup your Betaflight OSD to match:
-A) These are all on the left margin
-B) I Find it's easier to start at the bottom and work your way up
-C) Not all numbered items are on their own row, see notes by each entry
 
+A) These are all on the left margin
+
+B) I Find it's easier to start at the bottom and work your way up
+
+C) Not all numbered items are on their own row, see notes by each entry
+---------------------------------------------------------------------------------------
 1) Craft Name 
 
 2) Timer 2 
