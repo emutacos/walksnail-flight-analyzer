@@ -200,7 +200,7 @@ def extract_plot_data(filepath):
 class FlightDashboard(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FPV Aerodynamic Flight Analyzer")
+        self.title("Walksnail Flight Analyzer")
         self.geometry("1500x950")
         self.iconbitmap("icon.ico")
 
