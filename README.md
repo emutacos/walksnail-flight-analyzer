@@ -4,7 +4,7 @@ This tool is designed to help you find the differences between two flights using
 
 Please setup your Betaflight OSD to match:
 -
-
+![Project Banner](readme_screenshot_2.png)
 * These are all on the left margin
 
 * I Find it's easier to start at the bottom and work your way up
