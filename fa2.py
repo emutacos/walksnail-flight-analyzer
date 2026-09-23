@@ -1,6 +1,7 @@
 import csv
 import re
 import os
+import collections
 import tkinter as tk
 from tkinter import filedialog, messagebox, colorchooser
 import matplotlib.pyplot as plt
@@ -23,14 +24,20 @@ def parse_walksnail_osd(input_file, cipher, speed_regex):
     log.append(f">> Read {len(raw_data):,} bytes of raw data")
     cleaned_data = raw_data.replace('\x00', '').replace('\r', ' ')
     
-    log.append(">> Stripping null bytes & telemetry headers...")
-    if "- - -" in cleaned_data and "S T A T S" in cleaned_data:
-        cleaned_data = cleaned_data[:cleaned_data.find("- - -")]
-    if "A R M E D" in cleaned_data:
-        cleaned_data = cleaned_data[cleaned_data.rfind("A R M E D") + 9:]
-    elif "BTFL" in cleaned_data:
-        cleaned_data = cleaned_data[cleaned_data.rfind("BTFL") + 4:]
+    log.append(">> Isolating telemetry frames...")
+    
+    # Strip the end-of-flight stats screen so it doesn't get parsed as telemetry
+    if "S T A T S" in cleaned_data:
+        stats_idx = cleaned_data.find("S T A T S")
+        # Find the '- - -' banner immediately preceding STATS, avoiding telemetry dashes
+        banner_idx = cleaned_data.rfind("- - -", 0, stats_idx)
+        
+        if banner_idx != -1 and (stats_idx - banner_idx) < 100:
+            cleaned_data = cleaned_data[:banner_idx]
+        else:
+            cleaned_data = cleaned_data[:stats_idx]
 
+    # Split by cipher to isolate frames. frames[0] is the preamble, [1:] are the telemetry blocks.
     frames = cleaned_data.split(cipher)[1:] 
     log.append(f">> Cipher isolated {len(frames):,} total OSD frames")
 
@@ -44,7 +51,7 @@ def parse_walksnail_osd(input_file, cipher, speed_regex):
     csv_rows = []
 
     patterns = {
-        'time': r'(\d{1,2}:\d{2}(?::\d{2})?)',
+        'time': r'(\d\s*\d?\s*:\s*\d\s*\d(?:\s*:\s*\d\s*\d)?)',
         'speed': speed_regex, 
         'altitude': r'\x7f[\s]*([\-\d\.\s]{1,15})\x0f',
         'vario': r'([uvw])[\s]*([\d\.\s]{1,15})™',
@@ -65,6 +72,9 @@ def parse_walksnail_osd(input_file, cipher, speed_regex):
     compiled_patterns = {key: re.compile(pat) for key, pat in patterns.items()}
 
     log.append(">> Extracting aerodynamic variables at high resolution...")
+    
+    last_known = {} # Keeps tracking missing telemetry values to prevent graph zig-zags to zero
+    
     for frame in frames:
         def extract(key, group=1, default=""):
             match = compiled_patterns[key].search(frame)
@@ -80,14 +90,42 @@ def parse_walksnail_osd(input_file, cipher, speed_regex):
                 return val_str
             return ""
 
-        flight_time = extract('time')
+        # Extract current frame elements
+        curr = {
+            'time': extract('time'),
+            'speed': extract('speed'),
+            'altitude': extract('altitude'),
+            'vario_dir': extract('vario', 1),
+            'vario_val': extract('vario', 2),
+            'gps_sats': extract('gps_sats'),
+            'link_quality': extract('link_quality'),
+            'home_dist': extract_dist('home_dist'),
+            'flight_dist': extract_dist('flight_dist'),
+            'roll': extract('roll'),
+            'pitch': extract('pitch'),
+            'throttle': extract('throttle'),
+            'efficiency': extract('efficiency'),
+            'mah': extract('mah'),
+            'wattage': extract('wattage'),
+            'amps': extract('amps'),
+            'voltage': extract('voltage')
+        }
+
+        # Forward fill: if a frame skipped a metric, hold the previous known value
+        for k, v in curr.items():
+            if v == "":
+                curr[k] = last_known.get(k, "")
+            else:
+                last_known[k] = v
+
+        flight_time = curr['time']
         row = [
-            flight_time, extract('speed'), extract('altitude'), 
-            extract('vario', 1), extract('vario', 2), extract('gps_sats'), 
-            extract('link_quality'), extract_dist('home_dist'), 
-            extract_dist('flight_dist'), extract('roll'), extract('pitch'), 
-            "", "", extract('throttle'), extract('efficiency'), 
-            extract('mah'), extract('wattage'), extract('amps'), extract('voltage')
+            curr['time'], curr['speed'], curr['altitude'], 
+            curr['vario_dir'], curr['vario_val'], curr['gps_sats'], 
+            curr['link_quality'], curr['home_dist'], curr['flight_dist'], 
+            curr['roll'], curr['pitch'], "", "", curr['throttle'], 
+            curr['efficiency'], curr['mah'], curr['wattage'], 
+            curr['amps'], curr['voltage']
         ]
 
         if sum(1 for item in row if item != "") >= 5 and flight_time:
@@ -109,23 +147,74 @@ def parse_walksnail_osd(input_file, cipher, speed_regex):
 # ==========================================
 # 2. DATA ANALYSIS & GRAPHING LOGIC
 # ==========================================
-def analyze_data(filepath):
-    speeds, amps, watts, altitudes, mahs, distances, throttles = [], [], [], [], [0], [0], []
+def get_row_speeds(filepath, mode):
     with open(filepath, 'r') as f:
-        for row in csv.DictReader(f):
+        rows = list(csv.DictReader(f))
+
+    speeds = []
+    if mode == 'Horizontal':
+        for row in rows:
             try:
                 speeds.append(float(row.get('Speed', 0) or 0))
-                amp = float(row.get('Amps', 0) or 0)
-                watt = float(row.get('Wattage', 0) or 0)
-                if amp > 0: amps.append(amp)
-                if watt > 0: watts.append(watt)
-                altitudes.append(float(row.get('Altitude', 0) or 0))
-                mahs.append(float(row.get('mAh Consumed', 0) or 0))
-                distances.append(float(row.get('Flight Dist (ft)', 0) or 0))
-                
-                thr = float(row.get('Throttle %', 0) or 0)
-                if thr > 0: throttles.append(thr)
+            except ValueError:
+                speeds.append(0.0)
+    else: 
+        # Vertical (Punch-out) Mode: Calculate upward ft/s via altitude derivative
+        sec_alts = {}
+        for row in rows:
+            ts = row.get('Flight Time', '')
+            if not ts or ':' not in ts: continue
+            pts = ts.split(':')
+            secs = int(pts[0])*60 + int(pts[1]) if len(pts)==2 else int(pts[0])*3600 + int(pts[1])*60 + int(pts[2])
+            try:
+                alt = float(row.get('Altitude', 0) or 0)
+                if secs not in sec_alts: sec_alts[secs] = []
+                sec_alts[secs].append(alt)
             except ValueError: continue
+
+        sec_avg_alt = {s: sum(vals)/len(vals) for s, vals in sec_alts.items()}
+
+        for row in rows:
+            ts = row.get('Flight Time', '')
+            if not ts or ':' not in ts:
+                speeds.append(0.0)
+                continue
+            pts = ts.split(':')
+            secs = int(pts[0])*60 + int(pts[1]) if len(pts)==2 else int(pts[0])*3600 + int(pts[1])*60 + int(pts[2])
+
+            curr_alt = sec_avg_alt.get(secs, 0)
+            prev_alt = sec_avg_alt.get(secs - 1, curr_alt)
+            
+            # Punch-out logic: Only measure positive altitude changes (ascents)
+            v_speed = curr_alt - prev_alt 
+            speeds.append(v_speed if v_speed > 0 else 0.0)
+
+    return speeds, rows
+
+def analyze_data(filepath, mode):
+    speeds, rows = get_row_speeds(filepath, mode)
+    amps, watts, altitudes, mahs, distances, throttles, voltages = [], [], [], [0], [0], [], []
+    
+    def safe_float(val):
+        try: return float(val or 0)
+        except ValueError: return 0.0
+
+    for row in rows:
+        amp = safe_float(row.get('Amps', 0))
+        if amp > 0: amps.append(amp)
+        
+        watt = safe_float(row.get('Wattage', 0))
+        if watt > 0: watts.append(watt)
+        
+        volt = safe_float(row.get('Voltage', 0))
+        if volt > 0: voltages.append(volt)
+        
+        altitudes.append(safe_float(row.get('Altitude', 0)))
+        mahs.append(safe_float(row.get('mAh Consumed', 0)))
+        distances.append(safe_float(row.get('Flight Dist (ft)', 0)))
+        
+        thr = safe_float(row.get('Throttle %', 0))
+        if thr > 0: throttles.append(thr)
 
     t_dist = max(distances)
     avg_spd = sum(speeds) / len(speeds) if speeds else 0
@@ -135,10 +224,13 @@ def analyze_data(filepath):
         "Total Flight Distance": t_dist,
         "Total mAh Consumed": max(mahs),
         "Efficiency (mAh/mile)": (max(mahs) / (t_dist / 5280)) if t_dist > 0 else 0,
+        "Max Wattage": max(watts) if watts else 0,
         "Max Speed": max(speeds) if speeds else 0,
         "Overall Avg Speed": avg_spd,
         "Average Throttle": sum(throttles) / len(throttles) if throttles else 0,
         "Overall Avg Amps": sum(amps) / len(amps) if amps else 0,
+        "Max Peak Amps": max(amps) if amps else 0,
+        "Min Voltage (Sag)": min(voltages) if voltages else 0,
         "Overall Avg Watts": sum(watts) / len(watts) if watts else 0,
         "Max Altitude": max(altitudes) if altitudes else 0,
         "Average Altitude": avg_alt,
@@ -146,24 +238,28 @@ def analyze_data(filepath):
         "Overall Drag (W/Speed)": (sum(watts) / len(watts)) / avg_spd if (watts and avg_spd > 0) else 0
     }
 
-def analyze_speed_tiers(filepath):
+def analyze_speed_tiers(filepath, mode):
+    speeds, rows = get_row_speeds(filepath, mode)
     tiers = {}
-    with open(filepath, 'r') as f:
-        for row in csv.DictReader(f):
-            try:
-                speed = float(row.get('Speed', 0) or 0)
-                pitch = float(row.get('Pitch', 0) or 0)
-                throttle = float(row.get('Throttle %', 0) or 0)
-                watt = float(row.get('Wattage', 0) or 0)
-                
-                if speed >= 5 and watt > 0:
-                    bucket = int(round(speed / 10.0) * 10)
-                    if bucket not in tiers:
-                        tiers[bucket] = {'p': [], 't': [], 'w': []}
-                    tiers[bucket]['p'].append(pitch)
-                    tiers[bucket]['t'].append(throttle)
-                    tiers[bucket]['w'].append(watt)
-            except ValueError: continue
+    
+    for i, row in enumerate(rows):
+        try:
+            speed = speeds[i]
+            pitch = float(row.get('Pitch', 0) or 0)
+            throttle = float(row.get('Throttle %', 0) or 0)
+            watt = float(row.get('Wattage', 0) or 0)
+            
+            min_speed = 5 if mode == 'Vertical (Punch-out)' else 5
+            
+            if speed >= min_speed and watt > 0:
+                bucket_size = 5 if mode == 'Vertical (Punch-out)' else 10
+                bucket = int(round(speed / float(bucket_size)) * bucket_size)
+                if bucket not in tiers:
+                    tiers[bucket] = {'p': [], 't': [], 'w': []}
+                tiers[bucket]['p'].append(pitch)
+                tiers[bucket]['t'].append(throttle)
+                tiers[bucket]['w'].append(watt)
+        except ValueError: continue
             
     results = {}
     for b in sorted(tiers.keys()):
@@ -176,22 +272,41 @@ def analyze_speed_tiers(filepath):
             }
     return results
 
-def extract_plot_data(filepath):
-    times, speeds, watts, altitudes, throttles = [], [], [], [], []
-    with open(filepath, 'r') as f:
-        for row in csv.DictReader(f):
-            try:
-                ts = row.get('Flight Time', '')
-                if not ts or ':' not in ts: continue
-                pts = ts.split(':')
-                secs = int(pts[0])*60 + int(pts[1]) if len(pts)==2 else int(pts[0])*3600 + int(pts[1])*60 + int(pts[2])
-                times.append(secs)
-                speeds.append(float(row.get('Speed', 0) or 0))
-                watts.append(float(row.get('Wattage', 0) or 0))
-                altitudes.append(float(row.get('Altitude', 0) or 0))
-                throttles.append(float(row.get('Throttle %', 0) or 0))
-            except ValueError: continue
-    return times, speeds, watts, altitudes, throttles
+def extract_plot_data(filepath, mode):
+    speeds, rows = get_row_speeds(filepath, mode)
+    raw_times, out_speeds, watts, altitudes, throttles, voltages = [], [], [], [], [], []
+    
+    def safe_float(val):
+        try: return float(val or 0)
+        except ValueError: return 0.0
+    
+    for i, row in enumerate(rows):
+        ts = row.get('Flight Time', '')
+        if not ts or ':' not in ts: continue
+        
+        pts = ts.split(':')
+        secs = int(pts[0])*60 + int(pts[1]) if len(pts)==2 else int(pts[0])*3600 + int(pts[1])*60 + int(pts[2])
+        
+        raw_times.append(secs)
+        out_speeds.append(speeds[i])
+        watts.append(safe_float(row.get('Wattage', 0)))
+        altitudes.append(safe_float(row.get('Altitude', 0)))
+        throttles.append(safe_float(row.get('Throttle %', 0)))
+        voltages.append(safe_float(row.get('Voltage', 0)))
+
+    # Distribute stacked frames evenly across each second for a smooth plot
+    counts = {}
+    for s in raw_times:
+        counts[s] = counts.get(s, 0) + 1
+        
+    seen = {}
+    times = []
+    for s in raw_times:
+        seen[s] = seen.get(s, 0) + 1
+        fraction = (seen[s] - 1) / counts[s]
+        times.append(s + fraction)
+        
+    return times, out_speeds, watts, altitudes, throttles, voltages
 
 # ==========================================
 # 3. GRAPHICAL DASHBOARD (TKINTER)
@@ -217,14 +332,14 @@ class FlightDashboard(tk.Tk):
         
         self.cipher_var = tk.StringVar(value="œ")
         self.speed_regex_var = tk.StringVar(value=r"p[\s]*([\d\.\s]{1,15})(?:\x9d)?")
-        self.craft_regex_var = tk.StringVar(value=r"([A-Za-z0-9][A-Za-z0-9_ \"\'\-\.]*?)\s{5,}$")
+        self.craft_regex_var = tk.StringVar(value=r"(unused_regex)") 
+        self.flight_mode_var = tk.StringVar(value="Horizontal")
         
         self.color1 = tk.StringVar(value="#1f77b4")
         self.color2 = tk.StringVar(value="#ff7f0e")
         self.sync_name1_var = tk.BooleanVar(value=False)
         self.sync_name2_var = tk.BooleanVar(value=False)
         
-        # --- NATIVE MENU BAR SETUP ---
         menubar = tk.Menu(self)
         self.config(menu=menubar)
 
@@ -250,7 +365,6 @@ class FlightDashboard(tk.Tk):
         help_menu.add_command(label="About", command=self.open_about_window)
         menubar.add_cascade(label="Help", menu=help_menu)
         
-        # --- SLIM QUICK-ACCESS TOOLBAR ---
         toolbar = tk.Frame(self, padx=10, pady=8, bg="#e9ecef", bd=1, relief=tk.RAISED)
         toolbar.pack(fill=tk.X)
 
@@ -268,6 +382,13 @@ class FlightDashboard(tk.Tk):
 
         tk.Button(toolbar, text="▶ ANALYZE", bg="#2a9d8f", fg="white", font=("Arial", 9, "bold"), cursor="hand2", command=self.run_analysis, padx=12).pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(toolbar, text="CLEAR", bg="#e76f51", fg="white", font=("Arial", 9, "bold"), cursor="hand2", command=self.clear_all, padx=10).pack(side=tk.LEFT, padx=(0, 10))
+        
+        tk.Frame(toolbar, width=2, bg="gray").pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=2)
+        
+        tk.Label(toolbar, text="Flight Mode:", font=("Arial", 9, "bold"), bg="#e9ecef").pack(side=tk.LEFT, padx=(5, 2))
+        mode_menu = tk.OptionMenu(toolbar, self.flight_mode_var, "Horizontal", "Vertical (Punch-out)", command=lambda _: self.run_analysis())
+        mode_menu.config(bg="#e9ecef", font=("Arial", 9), cursor="hand2")
+        mode_menu.pack(side=tk.LEFT, padx=(0, 10))
         
         tk.Frame(toolbar, width=2, bg="gray").pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=2)
 
@@ -311,12 +432,10 @@ class FlightDashboard(tk.Tk):
 
         tk.Button(toolbar, text="🔍 Debug", font=("Arial", 8), command=lambda: self.open_debug_window(2)).pack(side=tk.LEFT, padx=(0, 10))
 
-        # --- BOTTOM TASKBAR (Status Bar) ---
         self.status_frame = tk.Frame(self, bg="#e9ecef", bd=1, relief=tk.RAISED, padx=10, pady=6)
         self.status_frame.pack(side=tk.BOTTOM, fill=tk.X)
         tk.Label(self.status_frame, text="Ready. Load two flights via the File menu to calculate performance verdicts.", bg="#e9ecef", fg="gray", font=("Arial", 10, "italic")).pack(side=tk.LEFT)
 
-        # --- MAIN SPLIT LAYOUT (50/50) ---
         main_pane = tk.PanedWindow(self, orient=tk.HORIZONTAL)
         main_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
@@ -349,7 +468,6 @@ class FlightDashboard(tk.Tk):
         self.txt_log2.insert(tk.END, ">> Awaiting Flight 2 OSD...")
         self.txt_log2.config(state=tk.DISABLED)
 
-        # --- SCROLLABLE TABLE CONTAINER ---
         table_container = tk.Frame(self.left_pane, bg="#f8f9fa")
         table_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         
@@ -446,9 +564,9 @@ class FlightDashboard(tk.Tk):
         tk.Entry(pad_frame, textvariable=self.speed_regex_var, width=35, font=("Consolas", 10)).grid(row=1, column=1, sticky="w", padx=10)
         
         tk.Label(pad_frame, text="Craft Name Regex:", font=("Arial", 10, "bold")).grid(row=2, column=0, sticky="w", pady=10)
-        tk.Entry(pad_frame, textvariable=self.craft_regex_var, width=35, font=("Consolas", 10)).grid(row=2, column=1, sticky="w", padx=10)
+        tk.Entry(pad_frame, textvariable=self.craft_regex_var, width=35, font=("Consolas", 10), state="disabled").grid(row=2, column=1, sticky="w", padx=10)
         
-        tk.Label(pad_frame, text="(Changes will apply on next file load)", fg="gray", font=("Arial", 9)).grid(row=3, column=0, columnspan=2, pady=10)
+        tk.Label(pad_frame, text="(Name Extraction Now Handled Automatically by Consensus)", fg="gray", font=("Arial", 9)).grid(row=3, column=0, columnspan=2, pady=10)
 
     def open_about_window(self):
         about_win = tk.Toplevel(self)
@@ -516,12 +634,13 @@ class FlightDashboard(tk.Tk):
                 raw_data = f.read()
                 
             cleaned_data = raw_data.replace('\x00', '').replace('\r', ' ')
-            if "- - -" in cleaned_data and "S T A T S" in cleaned_data:
-                cleaned_data = cleaned_data[:cleaned_data.find("- - -")]
-            if "A R M E D" in cleaned_data:
-                cleaned_data = cleaned_data[cleaned_data.rfind("A R M E D") + 9:]
-            elif "BTFL" in cleaned_data:
-                cleaned_data = cleaned_data[cleaned_data.rfind("BTFL") + 4:]
+            if "S T A T S" in cleaned_data:
+                stats_idx = cleaned_data.find("S T A T S")
+                banner_idx = cleaned_data.rfind("- - -", 0, stats_idx)
+                if banner_idx != -1 and (stats_idx - banner_idx) < 100:
+                    cleaned_data = cleaned_data[:banner_idx]
+                else:
+                    cleaned_data = cleaned_data[:stats_idx]
                 
             frames = cleaned_data.split(self.cipher_var.get())[:50] 
             
@@ -536,24 +655,49 @@ class FlightDashboard(tk.Tk):
         except Exception as e:
             txt.insert(tk.END, f"Error reading file: {str(e)}")
 
-    def get_craft_name(self, filepath, cipher, regex):
-        if not regex: return "Unknown"
+    def get_craft_name(self, filepath, cipher, regex=None):
         try:
             with open(filepath, 'r', encoding='cp1252', errors='ignore') as f:
                 raw_data = f.read()
             cleaned_data = raw_data.replace('\x00', '').replace('\r', ' ')
-            if "- - -" in cleaned_data and "S T A T S" in cleaned_data:
-                cleaned_data = cleaned_data[:cleaned_data.find("- - -")]
-            if "A R M E D" in cleaned_data:
-                cleaned_data = cleaned_data[cleaned_data.rfind("A R M E D") + 9:]
-            elif "BTFL" in cleaned_data:
-                cleaned_data = cleaned_data[cleaned_data.rfind("BTFL") + 4:]
+            
+            if "S T A T S" in cleaned_data:
+                stats_idx = cleaned_data.find("S T A T S")
+                banner_idx = cleaned_data.rfind("- - -", 0, stats_idx)
+                if banner_idx != -1 and (stats_idx - banner_idx) < 100:
+                    cleaned_data = cleaned_data[:banner_idx]
+                else:
+                    cleaned_data = cleaned_data[:stats_idx]
+                
             frames = cleaned_data.split(cipher)
-            if len(frames) > 0:
-                match = re.search(regex, frames[0])
-                if match:
-                    craft = match.group(1).strip()
-                    if craft: return craft
+            potential_names = []
+            
+            # Scan up to 50 frames to build a consensus
+            for frame in frames[:50]:
+                # 1. Strip the massive block of trailing spaces
+                stripped = frame.rstrip()
+                if not stripped: continue
+                
+                # 2. Isolate the final text cluster by splitting on large gaps (3+ spaces)
+                # This safely bypasses "ARMED" and grabs the whole tail end
+                clusters = re.split(r'\s{3,}', stripped)
+                final_cluster = clusters[-1]
+                
+                # 3. Clean out hidden bytes, but KEEP spaces, quotes, periods, and hyphens
+                clean_name = re.sub(r'[^A-Za-z0-9\-_ \"\'.]', '', final_cluster).strip()
+                
+                # 4. Walksnail garbage is typically a single stray letter/char + a space (e.g., "q ", "u ")
+                # This regex strips exactly one character and a space ONLY if it's at the very start
+                clean_name = re.sub(r'^.\s+', '', clean_name)
+                
+                if clean_name and len(clean_name) > 1:
+                    potential_names.append(clean_name)
+                    
+            if potential_names:
+                # Return the most common result to ensure accuracy
+                best_match = collections.Counter(potential_names).most_common(1)[0][0]
+                return best_match[:30]
+                
         except Exception:
             pass
         return "Unknown"
@@ -563,7 +707,10 @@ class FlightDashboard(tk.Tk):
         if f:
             self.osd1_path = f
             self.lbl_f1.config(text=os.path.basename(f), fg="black", font=("Arial", 9, "bold"))
-            craft = self.get_craft_name(f, self.cipher_var.get(), self.craft_regex_var.get())
+            
+            # Using the new consensus-based extraction
+            craft = self.get_craft_name(f, self.cipher_var.get())
+            
             if craft != "Unknown":
                 self.current_craft1 = craft
                 self.craft_lbl_f1.config(text=f"[{craft}]")
@@ -587,7 +734,10 @@ class FlightDashboard(tk.Tk):
         if f:
             self.osd2_path = f
             self.lbl_f2.config(text=os.path.basename(f), fg="black", font=("Arial", 9, "bold"))
-            craft = self.get_craft_name(f, self.cipher_var.get(), self.craft_regex_var.get())
+            
+            # Using the new consensus-based extraction
+            craft = self.get_craft_name(f, self.cipher_var.get())
+            
             if craft != "Unknown":
                 self.current_craft2 = craft
                 self.craft_lbl_f2.config(text=f"[{craft}]")
@@ -611,26 +761,15 @@ class FlightDashboard(tk.Tk):
             messagebox.showwarning("Missing Files", "Please select two OSD files via the File menu first.")
             return
             
+        mode = self.flight_mode_var.get()
+        spd_unit = "ft/s" if mode == "Vertical (Punch-out)" else "mph"
+        
         n1, n2 = self.name1.get(), self.name2.get()
         c1, c2 = self.color1.get(), self.color2.get()
-        d1, d2 = analyze_data(self.file1), analyze_data(self.file2)
+        d1, d2 = analyze_data(self.file1, mode), analyze_data(self.file2, mode)
         
-        tiers1 = analyze_speed_tiers(self.file1)
-        tiers2 = analyze_speed_tiers(self.file2)
-        
-        def get_best_cruise(tiers):
-            best_speed = 0
-            min_drag = float('inf')
-            for b, data in tiers.items():
-                if b > 0 and data['watt'] > 0:
-                    drag = data['watt'] / b
-                    if drag < min_drag:
-                        min_drag = drag
-                        best_speed = b
-            return best_speed
-
-        best_cruise1 = get_best_cruise(tiers1)
-        best_cruise2 = get_best_cruise(tiers2)
+        tiers1 = analyze_speed_tiers(self.file1, mode)
+        tiers2 = analyze_speed_tiers(self.file2, mode)
         
         for widget in self.status_frame.winfo_children():
             widget.destroy()
@@ -643,18 +782,24 @@ class FlightDashboard(tk.Tk):
             else:
                 return (name1, col1) if val1 > val2 else (name2, col2)
                 
-        eff_win, eff_col = get_winner(d1["Efficiency (mAh/mile)"], d2["Efficiency (mAh/mile)"], n1, n2, c1, c2, True)
+        if mode == "Vertical (Punch-out)":
+            eff_win, eff_col = get_winner(d1["Max Wattage"], d2["Max Wattage"], n1, n2, c1, c2, False)
+            banner_eff_text = "⚡ Highest Peak Wattage: "
+        else:
+            eff_win, eff_col = get_winner(d1["Efficiency (mAh/mile)"], d2["Efficiency (mAh/mile)"], n1, n2, c1, c2, True)
+            banner_eff_text = "🏆 Most Efficient: "
+
         drag_win, drag_col = get_winner(d1["Overall Drag (W/Speed)"], d2["Overall Drag (W/Speed)"], n1, n2, c1, c2, True)
         spd_win, spd_col = get_winner(d1["Max Speed"], d2["Max Speed"], n1, n2, c1, c2, False)
 
         tk.Label(self.status_frame, text="FLIGHT COMPARISON SUMMARY:", font=("Arial", 10, "bold"), bg="#e9ecef").pack(side=tk.LEFT, padx=(5, 15))
-        tk.Label(self.status_frame, text="🏆 Most Efficient: ", font=("Arial", 10), bg="#e9ecef").pack(side=tk.LEFT)
+        tk.Label(self.status_frame, text=banner_eff_text, font=("Arial", 10), bg="#e9ecef").pack(side=tk.LEFT)
         tk.Label(self.status_frame, text=eff_win, font=("Arial", 10, "bold"), fg=eff_col, bg="#e9ecef").pack(side=tk.LEFT)
         tk.Label(self.status_frame, text="   |   ", font=("Arial", 10), bg="#e9ecef").pack(side=tk.LEFT)
         tk.Label(self.status_frame, text="💨 Least Overall Drag: ", font=("Arial", 10), bg="#e9ecef").pack(side=tk.LEFT)
         tk.Label(self.status_frame, text=drag_win, font=("Arial", 10, "bold"), fg=drag_col, bg="#e9ecef").pack(side=tk.LEFT)
         tk.Label(self.status_frame, text="   |   ", font=("Arial", 10), bg="#e9ecef").pack(side=tk.LEFT)
-        tk.Label(self.status_frame, text="🚀 Highest Top Speed: ", font=("Arial", 10), bg="#e9ecef").pack(side=tk.LEFT)
+        tk.Label(self.status_frame, text=f"🚀 Highest Top Speed ({spd_unit}): ", font=("Arial", 10), bg="#e9ecef").pack(side=tk.LEFT)
         tk.Label(self.status_frame, text=spd_win, font=("Arial", 10, "bold"), fg=spd_col, bg="#e9ecef").pack(side=tk.LEFT)
 
         for widget in self.table_frame.winfo_children():
@@ -667,18 +812,27 @@ class FlightDashboard(tk.Tk):
         
         metrics = [
             ("Total Flight Distance", "{:.0f} ft"),
-            ("Total mAh Consumed", "{:.0f} mAh"),
-            ("Efficiency (mAh/mile)", "{:.0f} mAh/mi"),
-            ("Max Speed", "{:.1f} mph"),
-            ("Overall Avg Speed", "{:.1f} mph"),
+            ("Total mAh Consumed", "{:.0f} mAh")
+        ]
+        
+        if mode == "Vertical (Punch-out)":
+            metrics.append(("Max Wattage", "{:.0f} W"))
+        else:
+            metrics.append(("Efficiency (mAh/mile)", "{:.0f} mAh/mi"))
+            
+        metrics.extend([
+            ("Max Speed", f"{{:.1f}} {spd_unit}"),
+            ("Overall Avg Speed", f"{{:.1f}} {spd_unit}"),
             ("Average Throttle", "{:.1f} %"),
             ("Overall Avg Amps", "{:.2f} A"),
+            ("Max Peak Amps", "{:.1f} A"),
+            ("Min Voltage (Sag)", "{:.2f} V"),
             ("Overall Avg Watts", "{:.0f} W"),
             ("Max Altitude", "{:.1f} ft"),
             ("Average Altitude", "{:.1f} ft"),
             ("Avg Altitude Variance", "{:.1f} ft off avg"),
-            ("Overall Drag (W/Speed)", "{:.2f} W per mph")
-        ]
+            ("Overall Drag (W/Speed)", f"{{:.2f}} W per {spd_unit}")
+        ])
         
         row_idx = 1
         for key, fmt in metrics:
@@ -687,7 +841,6 @@ class FlightDashboard(tk.Tk):
             tk.Label(self.table_frame, text=fmt.format(d2[key]), font=("Consolas", 10), bg="#f8f9fa").grid(row=row_idx, column=2, sticky="e", padx=15, pady=padding_y)
             row_idx += 1
             
-        # RESTORED: Attitude by Speed Tier section
         tk.Frame(self.table_frame, height=2, bd=1, relief=tk.SUNKEN, bg="gray").grid(row=row_idx, column=0, columnspan=3, sticky="we", pady=8)
         row_idx += 1
         
@@ -697,7 +850,7 @@ class FlightDashboard(tk.Tk):
         all_buckets = sorted(set(list(tiers1.keys()) + list(tiers2.keys())))
         
         for b in all_buckets:
-            tk.Label(self.table_frame, text=f"{b} mph", font=("Arial", 10, "bold"), bg="#f8f9fa", anchor="w").grid(row=row_idx, column=0, sticky="w", pady=1)
+            tk.Label(self.table_frame, text=f"{b} {spd_unit}", font=("Arial", 10, "bold"), bg="#f8f9fa", anchor="w").grid(row=row_idx, column=0, sticky="w", pady=1)
             
             if b in tiers1:
                 t1_data = tiers1[b]
@@ -715,17 +868,16 @@ class FlightDashboard(tk.Tk):
             tk.Label(self.table_frame, text=txt2, font=("Consolas", 9), bg="#f8f9fa").grid(row=row_idx, column=2, sticky="e", padx=15, pady=1)
             row_idx += 1
 
-        # RESTORED: Drag Profile by Tier section
         tk.Frame(self.table_frame, height=2, bd=1, relief=tk.SUNKEN, bg="gray").grid(row=row_idx, column=0, columnspan=3, sticky="we", pady=8)
         row_idx += 1
         
-        tk.Label(self.table_frame, text="Drag Profile (W/mph) by Tier", font=("Arial", 11, "bold"), bg="#f8f9fa", anchor="w").grid(row=row_idx, column=0, sticky="w", pady=(0, 5))
+        tk.Label(self.table_frame, text=f"Drag Profile (W/{spd_unit}) by Tier", font=("Arial", 11, "bold"), bg="#f8f9fa", anchor="w").grid(row=row_idx, column=0, sticky="w", pady=(0, 5))
         row_idx += 1
         
         for b in all_buckets:
             if b == 0: continue 
             
-            tk.Label(self.table_frame, text=f"{b} mph", font=("Arial", 10, "bold"), bg="#f8f9fa", anchor="w").grid(row=row_idx, column=0, sticky="w", pady=1)
+            tk.Label(self.table_frame, text=f"{b} {spd_unit}", font=("Arial", 10, "bold"), bg="#f8f9fa", anchor="w").grid(row=row_idx, column=0, sticky="w", pady=1)
             
             drag1 = (tiers1[b]['watt'] / b) if b in tiers1 else None
             drag2 = (tiers2[b]['watt'] / b) if b in tiers2 else None
@@ -741,8 +893,8 @@ class FlightDashboard(tk.Tk):
                     t_col2 = c2
                     font_wt2 = "bold"
             
-            txt1 = f"{drag1:.2f} W/mph" if drag1 else "N/A"
-            txt2 = f"{drag2:.2f} W/mph" if drag2 else "N/A"
+            txt1 = f"{drag1:.2f} W/{spd_unit}" if drag1 else "N/A"
+            txt2 = f"{drag2:.2f} W/{spd_unit}" if drag2 else "N/A"
             
             tk.Label(self.table_frame, text=txt1, font=("Consolas", 10, font_wt1), fg=t_col1, bg="#f8f9fa").grid(row=row_idx, column=1, sticky="e", padx=15, pady=1)
             tk.Label(self.table_frame, text=txt2, font=("Consolas", 10, font_wt2), fg=t_col2, bg="#f8f9fa").grid(row=row_idx, column=2, sticky="e", padx=15, pady=1)
@@ -751,12 +903,12 @@ class FlightDashboard(tk.Tk):
         for widget in self.plot_frame.winfo_children():
             widget.destroy()
             
-        t1, s1, w1, a1, th1 = extract_plot_data(self.file1)
-        t2, s2, w2, a2, th2 = extract_plot_data(self.file2)
+        t1, s1, w1, a1, th1, v1 = extract_plot_data(self.file1, mode)
+        t2, s2, w2, a2, th2, v2 = extract_plot_data(self.file2, mode)
         
         fig = plt.figure(figsize=(10, 9))
         gs = fig.add_gridspec(4, 2, width_ratios=[1.5, 1])
-        fig.suptitle(f'Flight Profile & Aerodynamic Efficiency (High-Res)', fontsize=14, fontweight='bold')
+        fig.suptitle(f'Flight Profile & Aerodynamic Efficiency ({mode} Mode)', fontsize=14, fontweight='bold')
         
         ax1 = fig.add_subplot(gs[0, 0])
         ax2 = fig.add_subplot(gs[1, 0], sharex=ax1)
@@ -771,7 +923,7 @@ class FlightDashboard(tk.Tk):
         
         ax2.plot(t1, s1, label=n1, color=c1, linewidth=1.5)
         ax2.plot(t2, s2, label=n2, color=c2, linewidth=1.5)
-        ax2.set_ylabel('Speed (mph)')
+        ax2.set_ylabel(f'Speed ({spd_unit})')
         ax2.grid(True, linestyle='--', alpha=0.5)
         
         ax3.plot(t1, w1, label=n1, color=c1, linewidth=1.5)
@@ -786,17 +938,16 @@ class FlightDashboard(tk.Tk):
         ax4.grid(True, linestyle='--', alpha=0.5)
         
         ax5 = fig.add_subplot(gs[:, 1])
-        ax5.set_title('Aerodynamic Drag Profile', fontweight='bold')
         
+        ax5.set_title('Aerodynamic Drag Profile', fontweight='bold')
         spds1 = sorted([b for b in tiers1.keys() if b > 0])
         drg1 = [tiers1[b]['watt'] / b for b in spds1]
         spds2 = sorted([b for b in tiers2.keys() if b > 0])
         drg2 = [tiers2[b]['watt'] / b for b in spds2]
-
         ax5.plot(spds1, drg1, marker='o', color=c1, label=n1, linewidth=2)
         ax5.plot(spds2, drg2, marker='o', color=c2, label=n2, linewidth=2)
-        ax5.set_xlabel('Speed (mph)', fontweight='bold')
-        ax5.set_ylabel('Drag Cost (Watts per mph)', fontweight='bold')
+        ax5.set_xlabel(f'Speed ({spd_unit})', fontweight='bold')
+        ax5.set_ylabel(f'Drag Cost (Watts per {spd_unit})', fontweight='bold')
         ax5.grid(True, linestyle='--', alpha=0.5)
         ax5.legend(loc='upper left')
 
